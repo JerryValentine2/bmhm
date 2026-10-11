@@ -7,12 +7,18 @@ Setup (BMHM must authorize an approved LinkedIn application):
   export LINKEDIN_VERSION='202609'  # use a currently supported YYYYMM version
 
 Examples:
+  python BMHM_LinkedIn.py profile --out ./My_LinkedIn_Data
+  python BMHM_LinkedIn.py posts --target person --out ./My_LinkedIn_Data
   python BMHM_LinkedIn.py events --out ./BMHM_LinkedIn_Data
   python BMHM_LinkedIn.py posts --out ./BMHM_LinkedIn_Data
   python BMHM_LinkedIn.py registrations --out ./BMHM_LinkedIn_Data
   python BMHM_LinkedIn.py videos --out ./BMHM_LinkedIn_Data
   python BMHM_LinkedIn.py merge --out ./BMHM_LinkedIn_Data
 
+Profile retrieves basic identity via OpenID Connect, not full career history.
+Personal posts require restricted r_member_social and LINKEDIN_PERSON_ID (the
+/v2/me API id, not a profile URL or OIDC sub). Automatic ID lookup requires
+profile API access. Use separate output folders for company and personal data.
 Events requires r_events; posts require r_organization_social; registrations
 require separately approved Lead Sync access. Video lookups require approved
 access and video IDs obtained from posts. This program does not scrape pages,
@@ -79,14 +85,19 @@ class LinkedIn:
     def __init__(self, token, version):
         self.token, self.version = token, version
 
-    def get(self, route, query):
-        url = BASE + route + "?" + urllib.parse.urlencode(query, safe="(),:")
+    def get(self, route, query, *, legacy=False):
+        url = ("https://api.linkedin.com/v2" if legacy else BASE) + route
+        if query:
+            url += "?" + urllib.parse.urlencode(query, safe="(),")
         headers = {
             "Authorization": "Bearer " + self.token,
             "Linkedin-Version": self.version,
             "X-Restli-Protocol-Version": "2.0.0",
             "Accept": "application/json",
         }
+        if legacy:
+            headers.pop("Linkedin-Version")
+            headers.pop("X-Restli-Protocol-Version")
         for attempt in range(4):
             try:
                 request = urllib.request.Request(url, headers=headers)
@@ -169,20 +180,51 @@ def run(args):
         return
 
     token = os.environ.get("LINKEDIN_ACCESS_TOKEN")
-    org_id = os.environ.get("LINKEDIN_ORGANIZATION_ID")
     version = os.environ.get("LINKEDIN_VERSION")
-    if not all((token, org_id, version)) or not re.fullmatch(r"\d{6}", version or ""):
-        raise RuntimeError("Set LINKEDIN_ACCESS_TOKEN, LINKEDIN_ORGANIZATION_ID and LINKEDIN_VERSION=YYYYMM")
-    client, org = LinkedIn(token, version), "urn:li:organization:" + org_id
+    if not token:
+        raise RuntimeError("Set LINKEDIN_ACCESS_TOKEN")
+    if args.command != "profile" and not re.fullmatch(r"\d{6}", version or ""):
+        raise RuntimeError("Set LINKEDIN_VERSION=YYYYMM")
+    client = LinkedIn(token, version)
+    org = None
+    if args.command in ("events", "registrations") or (
+            args.command == "posts" and args.target == "company"):
+        org_id = os.environ.get("LINKEDIN_ORGANIZATION_ID", "")
+        if not re.fullmatch(r"\d+", org_id):
+            raise RuntimeError("Set LINKEDIN_ORGANIZATION_ID to the numeric company Page ID")
+        org = "urn:li:organization:" + org_id
 
-    if args.command == "events":
+    if args.command == "profile":
+        items = [client.get("/userinfo", {}, legacy=True)]
+        fields = ["sub", "name", "given_name", "family_name", "picture",
+                  "locale", "email", "email_verified"]
+        rows = items
+    elif args.command == "events":
         items = client.pages("/events", {"q": "eventsByOrganizer", "organizer": org,
                              "timeBasedFilter": "(lifeCycleState:PAST)", "entryCriteria": "PUBLIC",
                              "sortOrder": "END_TIME_DESC", "excludeCancelled": "false"}, args.max_pages)
         rows, fields = event_rows(items), ["event_id", "title", "description", "starts_at_utc", "type",
                                            "organizer", "post_urn", "vanity_name"]
     elif args.command == "posts":
-        items = client.pages("/posts", {"q": "author", "author": org, "sortBy": "LAST_MODIFIED"}, args.max_pages)
+        author = org
+        if args.target == "person":
+            person_id = os.environ.get("LINKEDIN_PERSON_ID", "")
+            if not person_id:
+                try:
+                    person_id = client.get("/me", {}, legacy=True).get("id", "")
+                except RuntimeError as exc:
+                    raise RuntimeError(
+                        "Set LINKEDIN_PERSON_ID to your /v2/me API id. Automatic lookup "
+                        f"requires profile API access. {exc}") from None
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", person_id):
+                raise RuntimeError("LINKEDIN_PERSON_ID must be an API id, not a URL or URN")
+            author = "urn:li:person:" + person_id
+        try:
+            items = client.pages("/posts", {"q": "author", "author": author,
+                                 "sortBy": "LAST_MODIFIED"}, args.max_pages)
+        except RuntimeError as exc:
+            scope = "r_member_social" if args.target == "person" else "r_organization_social"
+            raise RuntimeError(f"Posts retrieval requires {scope} access. {exc}") from None
         rows, fields = post_rows(items), ["post_id", "published_at_utc", "commentary", "content_type",
                                           "content_json", "lifecycle_state"]
     elif args.command == "registrations":
@@ -223,10 +265,14 @@ def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=["events", "posts", "registrations", "videos", "merge"])
+    parser.add_argument("command", choices=["profile", "events", "posts", "registrations", "videos", "merge"])
+    parser.add_argument("--target", choices=["company", "person"], default="company",
+                        help="Posts author target; profile always retrieves your basic identity")
     parser.add_argument("--out", default="./BMHM_LinkedIn_Data", help="Output directory")
     parser.add_argument("--max-pages", type=int, default=100, help="Safety limit per paginated endpoint")
     args = parser.parse_args()
+    if args.target == "person" and args.command in ("events", "registrations", "merge"):
+        parser.error(f"{args.command} supports company Pages only")
     if args.max_pages < 1:
         parser.error("--max-pages must be positive")
     try:
@@ -237,3 +283,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
